@@ -9,6 +9,14 @@ const SUPPLY_ABI = [
   "function maxTotalSupply() view returns (uint256)",
   "function MAX_ELEMENTS() view returns (uint256)",
   "function TOTAL_SUPPLY() view returns (uint256)",
+  "function name() view returns (string)",
+  "function publicMintActive() view returns (bool)",
+  "function saleActive() view returns (bool)",
+  "function isPublicSaleActive() view returns (bool)",
+  "function mintingActive() view returns (bool)",
+  "function publicSaleOpen() view returns (bool)",
+  "function saleIsActive() view returns (bool)",
+  "function mintEnabled() view returns (bool)",
 ];
 
 const MAX_SUPPLY_FN_NAMES = [
@@ -19,8 +27,45 @@ const MAX_SUPPLY_FN_NAMES = [
   "TOTAL_SUPPLY",
 ];
 
+const PUBLIC_SALE_FN_NAMES = [
+  "publicMintActive",
+  "saleActive",
+  "isPublicSaleActive",
+  "mintingActive",
+  "publicSaleOpen",
+  "saleIsActive",
+  "mintEnabled",
+];
+
 function log(...args) {
   console.log(new Date().toISOString(), "[mintStats]", ...args);
+}
+
+// Reads the project's name via the standard ERC-721/1155 name() function.
+// Returns a string, or null if the contract doesn't expose one.
+export async function getProjectName(provider, address) {
+  const contract = new ethers.Contract(address, SUPPLY_ABI, provider);
+  try {
+    const name = await contract.name();
+    return name && name.trim() !== "" ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+// Checks common "is public sale live" view functions.
+// Returns true, false, or null if no matching function was found.
+export async function getPublicSaleStatus(provider, address) {
+  const contract = new ethers.Contract(address, SUPPLY_ABI, provider);
+  for (const fnName of PUBLIC_SALE_FN_NAMES) {
+    try {
+      const active = await contract[fnName]();
+      return Boolean(active);
+    } catch {
+      // function doesn't exist or reverted — try next candidate
+    }
+  }
+  return null; // no matching function found, status unknown
 }
 
 // Reads current minted count and (if available) max supply from a contract.
