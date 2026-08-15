@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import { runDeployerRiskCheck, formatRiskMessage } from "./deployerRisk.js";
 import { startTaggedWalletRefresh, getTaggedWallets } from "./taggedWallets.js";
 import { logEvent } from "./sheetLogger.js";
-import { getMintStats, formatMintProgress, startMintProgressTracker } from "./mintStats.js";
+import { getMintStats, formatMintProgress, startMintProgressTracker, getProjectName, getPublicSaleStatus } from "./mintStats.js";
 
 dotenv.config();
 
@@ -250,11 +250,25 @@ async function announceFreeMint(address, kind, reason, deployer) {
   const progressLine = formatMintProgress(stats);
   const mintLink = `https://robinhoodchain.blockscout.com/address/${address}/write-contract`;
 
+  const [projectName, publicSaleStatus] = await Promise.all([
+    getProjectName(provider, address).catch(() => null),
+    getPublicSaleStatus(provider, address).catch(() => null),
+  ]);
+
+  const publicSaleLine =
+    publicSaleStatus === true
+      ? "Public mint: 🟢 OPEN"
+      : publicSaleStatus === false
+      ? "Public mint: 🔴 not active"
+      : "Public mint: ⚪ unknown — verify manually";
+
   const message =
     `🆓 *Free mint detected — Robinhood Chain*\n\n` +
+    (projectName ? `Project: *${projectName}*\n` : ``) +
     `Contract: \`${address}\`\n` +
     `Standard: ERC-${kind}\n` +
     `Signal: ${reason}\n` +
+    `${publicSaleLine}\n` +
     (progressLine ? `Progress: ${progressLine}\n` : ``) +
     `\n[Mint here (connect wallet)](${mintLink})\n` +
     `[View on Blockscout](${explorerLink(address)})\n\n` +
