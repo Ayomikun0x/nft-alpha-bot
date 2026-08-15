@@ -2,6 +2,9 @@ import { ethers } from "ethers";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 import { runDeployerRiskCheck, formatRiskMessage } from "./deployerRisk.js";
+import { startTaggedWalletRefresh, getTaggedWallets } from "./taggedWallets.js";
+import { logEvent } from "./sheetLogger.js";
+import { getMintStats, formatMintProgress, startMintProgressTracker } from "./mintStats.js";
 
 dotenv.config();
 
@@ -26,6 +29,15 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 // EIP-165 interface IDs
 const ERC721_INTERFACE_ID = "0x80ac58cd";
 const ERC1155_INTERFACE_ID = "0xd9b67a26";
+
+// Event topic hashes used to spot transfers/mints landing in tagged wallets
+const ERC721_TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
+const ERC1155_TRANSFER_SINGLE_TOPIC = ethers.id(
+  "TransferSingle(address,address,address,uint256,uint256)"
+);
+const ERC1155_TRANSFER_BATCH_TOPIC = ethers.id(
+  "TransferBatch(address,address,address,uint256[],uint256[])"
+);
 
 // Minimal ABI: EIP-165 check + common "price" view functions collections use
 const PROBE_ABI = [
@@ -57,6 +69,65 @@ async function sendAlert(message) {
 
 function explorerLink(address) {
   return `https://robinhoodchain.blockscout.com/address/${address}`;
+}
+
+// Checks a block's Transfer/TransferSingle/TransferBatch logs for any
+// activity landing in one of our tagged wallets, and alerts immediately.
+async function checkTaggedWalletActivity(blockNumber) {
+  const taggedWallets = getTaggedWallets();
+  if (taggedWallets.size === 0) return; // no wallets configured, skip entirely
+
+  try {
+    // ERC-721: Transfer(from indexed, to indexed, tokenId) -> "to" is topics[2]
+    const erc721Logs = await provider.getLogs({
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+      topics: [ERC721_TRANSFER_TOPIC],
+    });
+
+    // ERC-1155: TransferSingle/TransferBatch -> "to" is topics[3]
+    const erc1155SingleLogs = await provider.getLogs({
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+      topics: [ERC1155_TRANSFER_SINGLE_TOPIC],
+    });
+    const erc1155BatchLogs = await provider.getLogs({
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+      topics: [ERC1155_TRANSFER_BATCH_TOPIC],
+    });
+
+    for (const log_ of erc721Logs) {
+      const to = "0x" + log_.topics[2]?.slice(26);
+      await alertIfTagged(to, log_.address, log_.transactionHash, taggedWallets);
+    }
+    for (const log_ of [...erc1155SingleLogs, ...erc1155BatchLogs]) {
+      const to = "0x" + log_.topics[3]?.slice(26);
+      await alertIfTagged(to, log_.address, log_.transactionHash, taggedWallets);
+    }
+  } catch (err) {
+    log("Error checking tagged wallet activity:", err.message);
+  }
+}
+
+async function alertIfTagged(toAddress, contractAddress, txHash, taggedWallets) {
+  const key = toAddress?.toLowerCase();
+  if (!key || !taggedWallets.has(key)) return;
+
+  const label = taggedWallets.get(key);
+  const message =
+    `🎯 *Tagged wallet activity*\n\n` +
+    `Wallet: \`${toAddress}\` (${label})\n` +
+    `Contract: \`${contractAddress}\`\n\n` +
+    `[View contract](${explorerLink(contractAddress)}) · [View tx](https://robinhoodchain.blockscout.com/tx/${txHash})`;
+
+  log(`TAGGED WALLET ALERT: ${label} (${toAddress}) received a token from ${contractAddress}`);
+  await sendAlert(message);
+  logEvent("Tagged Wallet", {
+    contract: contractAddress,
+    wallet: toAddress,
+    details: `${label} — tx ${txHash}`,
+  }).catch((err) => log("Sheet log failed:", err.message));
 }
 
 // Check whether a freshly deployed contract is ERC-721 / ERC-1155.
@@ -155,16 +226,44 @@ async function checkWatchedContractsInBlock(block) {
 }
 
 async function announceFreeMint(address, kind, reason, deployer) {
+  const stats = await getMintStats(provider, address).catch(() => ({
+    totalSupply: null,
+    maxSupply: null,
+  }));
+  const progressLine = formatMintProgress(stats);
+
   const message =
     `🆓 *Free mint detected — Robinhood Chain*\n\n` +
     `Contract: \`${address}\`\n` +
     `Standard: ERC-${kind}\n` +
-    `Signal: ${reason}\n\n` +
-    `[View on Blockscout](${explorerLink(address)})\n\n` +
+    `Signal: ${reason}\n` +
+    (progressLine ? `Progress: ${progressLine}\n` : ``) +
+    `\n[View on Blockscout](${explorerLink(address)})\n\n` +
     `_Deployer/wallet risk check running — follow-up incoming._`;
 
   log(`FREE MINT ALERT: ${address} (${reason})`);
   await sendAlert(message);
+  logEvent("Free Mint", { contract: address, wallet: deployer || "", details: reason }).catch(
+    (err) => log("Sheet log failed:", err.message)
+  );
+
+  // Track progress for a short window after detection — free mints move
+  // fast, so periodic updates matter more than a single snapshot.
+  startMintProgressTracker(
+    provider,
+    address,
+    (progress) => {
+      log(`Progress update for ${address}: ${progress}`);
+      sendAlert(`📈 *Mint progress update*\n\nContract: \`${address}\`\n${progress}`);
+      logEvent("Mint Progress", { contract: address, details: progress }).catch((err) =>
+        log("Sheet log failed:", err.message)
+      );
+    },
+    {
+      pollSeconds: Number(process.env.MINT_PROGRESS_POLL_SECONDS || 45),
+      durationMinutes: Number(process.env.MINT_PROGRESS_DURATION_MINUTES || 10),
+    }
+  );
 
   // Track B: run the deployer risk check in the background and send a
   // follow-up once it's done, so the initial alert isn't delayed by it.
@@ -172,6 +271,11 @@ async function announceFreeMint(address, kind, reason, deployer) {
     runDeployerRiskCheck(deployer)
       .then((riskSummary) => {
         const followUp = formatRiskMessage(deployer, riskSummary);
+        logEvent("Risk Check", {
+          contract: address,
+          wallet: deployer,
+          details: `${riskSummary.label} (score: ${riskSummary.score})`,
+        }).catch((err) => log("Sheet log failed:", err.message));
         return sendAlert(followUp);
       })
       .catch((err) => log("Risk check failed:", err.message));
@@ -195,10 +299,17 @@ async function processBlock(blockNumber) {
   checkWatchedContractsInBlock(block).catch((err) =>
     log("Error checking watched contracts:", err.message)
   );
+
+  // 3. Check for any tagged/smart wallet activity in this block
+  checkTaggedWalletActivity(blockNumber).catch((err) =>
+    log("Error in tagged wallet check:", err.message)
+  );
 }
 
 async function main() {
   log("Starting Robinhood Chain free mint detector...");
+
+  startTaggedWalletRefresh();
 
   const latest = await provider.getBlockNumber();
   const lookback = Number(STARTUP_LOOKBACK_BLOCKS);
