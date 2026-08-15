@@ -1,6 +1,7 @@
 import { ethers } from "ethers";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
+import { runDeployerRiskCheck, formatRiskMessage } from "./deployerRisk.js";
 
 dotenv.config();
 
@@ -97,16 +98,17 @@ async function handleNewContract(txHash) {
   if (!receipt || !receipt.contractAddress) return;
 
   const address = receipt.contractAddress;
+  const deployer = receipt.from;
   const kind = await detectNftKind(address);
   if (!kind) return; // not an NFT contract, ignore
 
-  log(`New ERC-${kind} contract detected: ${address}`);
+  log(`New ERC-${kind} contract detected: ${address} (deployer: ${deployer})`);
 
   const price = await probeMintPrice(address);
 
   if (price !== null && price === 0n) {
     // Confirmed free mint via on-chain price view function
-    await announceFreeMint(address, kind, "on-chain price() view returns 0");
+    await announceFreeMint(address, kind, "on-chain price() view returns 0", deployer);
   } else if (price !== null && price > 0n) {
     // Has a real price — not a free mint, no need to keep watching
     log(`  -> ${address} has nonzero mint price (${ethers.formatEther(price)} ETH), skipping`);
@@ -115,6 +117,7 @@ async function handleNewContract(txHash) {
     watching.set(address.toLowerCase(), {
       deployBlock: receipt.blockNumber,
       kind,
+      deployer,
     });
     log(`  -> No price view function on ${address}, will watch early mint txs instead`);
   }
@@ -135,7 +138,8 @@ async function checkWatchedContractsInBlock(block) {
       await announceFreeMint(
         tx.to,
         watched.kind,
-        "early mint transaction carried zero value"
+        "early mint transaction carried zero value",
+        watched.deployer
       );
       watching.delete(key);
       continue;
@@ -150,7 +154,7 @@ async function checkWatchedContractsInBlock(block) {
   }
 }
 
-async function announceFreeMint(address, kind, reason) {
+async function announceFreeMint(address, kind, reason, deployer) {
   const message =
     `🆓 *Free mint detected — Robinhood Chain*\n\n` +
     `Contract: \`${address}\`\n` +
@@ -162,9 +166,16 @@ async function announceFreeMint(address, kind, reason) {
   log(`FREE MINT ALERT: ${address} (${reason})`);
   await sendAlert(message);
 
-  // Placeholder hook: this is where Track B (deployer history + funding
-  // trace + scoring) plugs in and sends a follow-up message once ready.
-  // runDeployerRiskCheck(address).then(sendFollowUpAlert);
+  // Track B: run the deployer risk check in the background and send a
+  // follow-up once it's done, so the initial alert isn't delayed by it.
+  if (deployer) {
+    runDeployerRiskCheck(deployer)
+      .then((riskSummary) => {
+        const followUp = formatRiskMessage(deployer, riskSummary);
+        return sendAlert(followUp);
+      })
+      .catch((err) => log("Risk check failed:", err.message));
+  }
 }
 
 async function processBlock(blockNumber) {

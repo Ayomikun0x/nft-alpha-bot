@@ -81,11 +81,30 @@ Railway's free tier sleeps/limits usage after a threshold of monthly
 hours — keep an eye on your usage dashboard once it's running
 continuously.
 
+## Track B: Deployer risk check (now live)
+
+Right after a free-mint alert fires, the bot automatically runs a
+background check on the deployer wallet (`deployerRisk.js`) and sends a
+follow-up message a few seconds later with:
+
+- How many prior contracts that wallet has deployed, and whether those
+  old contracts still show recent on-chain activity (alive) or have
+  gone quiet for 30+ days (possible dead/rugged collection)
+- The deployer's original funding source — the wallet that sent it its
+  first-ever transaction — and whether that funding wallet has
+  established history (e.g. an exchange) or looks freshly created
+  just for this one deployment
+- A simple score and verdict: "Lower risk signals", "Neutral / not
+  enough history", or "⚠️ High risk — caution"
+
+This uses Blockscout's free API (no key needed) — no additional signup
+required for this part. It's a heuristic, not certainty: a new wallet
+with no history isn't automatically a scam, and a wallet with alive
+prior contracts isn't automatically safe. Always sanity-check manually
+before minting anything.
+
 ## What's next (not built yet)
 
-- **Track B**: deployer wallet history + first-funding-source trace +
-  scoring, triggered as a follow-up alert after the free-mint ping
-  (hook is already stubbed in `announceFreeMint` in `index.js`)
 - **Tagged smart wallets**: a watchlist of known good wallets, alerting
   when one of them mints/buys
 - **CT mention tracking**: manual/list-based for now, no paid Twitter API
