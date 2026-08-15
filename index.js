@@ -230,7 +230,25 @@ async function announceFreeMint(address, kind, reason, deployer) {
     totalSupply: null,
     maxSupply: null,
   }));
+
+  // Value filter: skip alerts for contracts that look like spam/farm mints
+  // rather than a real limited drop.
+  const requireKnownSupply = (process.env.REQUIRE_KNOWN_MAX_SUPPLY ?? "true") === "true";
+  const maxSupplyCeiling = BigInt(process.env.MAX_SUPPLY_CEILING || "50000");
+
+  if (requireKnownSupply && stats.maxSupply === null) {
+    log(`Skipping ${address}: no max supply declared (likely spam/uncapped mint)`);
+    return;
+  }
+  if (stats.maxSupply !== null && stats.maxSupply > maxSupplyCeiling) {
+    log(
+      `Skipping ${address}: max supply ${stats.maxSupply} exceeds ceiling of ${maxSupplyCeiling} (likely spam)`
+    );
+    return;
+  }
+
   const progressLine = formatMintProgress(stats);
+  const mintLink = `https://robinhoodchain.blockscout.com/address/${address}/write-contract`;
 
   const message =
     `🆓 *Free mint detected — Robinhood Chain*\n\n` +
@@ -238,7 +256,8 @@ async function announceFreeMint(address, kind, reason, deployer) {
     `Standard: ERC-${kind}\n` +
     `Signal: ${reason}\n` +
     (progressLine ? `Progress: ${progressLine}\n` : ``) +
-    `\n[View on Blockscout](${explorerLink(address)})\n\n` +
+    `\n[Mint here (connect wallet)](${mintLink})\n` +
+    `[View on Blockscout](${explorerLink(address)})\n\n` +
     `_Deployer/wallet risk check running — follow-up incoming._`;
 
   log(`FREE MINT ALERT: ${address} (${reason})`);
