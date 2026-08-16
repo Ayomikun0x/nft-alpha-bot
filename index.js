@@ -5,6 +5,7 @@ import { runDeployerRiskCheck, formatRiskMessage } from "./deployerRisk.js";
 import { startTaggedWalletRefresh, getTaggedWallets } from "./taggedWallets.js";
 import { logEvent } from "./sheetLogger.js";
 import { getMintStats, formatMintProgress, startMintProgressTracker, getProjectName, getPublicSaleStatus } from "./mintStats.js";
+import { executeMint, getMintWalletBalance } from "./mintBot.js";
 
 dotenv.config();
 
@@ -24,7 +25,7 @@ if (!RPC_URL || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 // EIP-165 interface IDs
 const ERC721_INTERFACE_ID = "0x80ac58cd";
@@ -181,8 +182,17 @@ async function handleNewContract(txHash) {
     // Confirmed free mint via on-chain price view function
     await announceFreeMint(address, kind, "on-chain price() view returns 0", deployer);
   } else if (price !== null && price > 0n) {
-    // Has a real price — not a free mint, no need to keep watching
-    log(`  -> ${address} has nonzero mint price (${ethers.formatEther(price)} ETH), skipping`);
+    const absurdThreshold = ethers.parseEther(process.env.ABSURD_PRICE_ETH_THRESHOLD || "100");
+    if (price > absurdThreshold) {
+      // Price is unachievably high — likely a disabled/paused mint, a
+      // misread function, or a broken/decoy deployment. Not a real paid mint.
+      log(
+        `  -> ${address} has an unreadable/absurd price (${ethers.formatEther(price)} ETH) — likely disabled or misconfigured, skipping`
+      );
+    } else {
+      // Has a real, plausible price — not a free mint, no need to keep watching
+      log(`  -> ${address} has nonzero mint price (${ethers.formatEther(price)} ETH), skipping`);
+    }
   } else {
     // No price view function found — fall back to watching early mint tx values
     watching.set(address.toLowerCase(), {
@@ -338,6 +348,53 @@ async function processBlock(blockNumber) {
     log("Error in tagged wallet check:", err.message)
   );
 }
+
+// --- Manual mint command handling ---
+// Only responds to messages from the configured chat — anyone else
+// messaging the bot is silently ignored, since this can spend real funds.
+bot.on("message", async (msg) => {
+  const chatId = String(msg.chat.id);
+  if (chatId !== String(TELEGRAM_CHAT_ID)) return; // ignore anyone else
+
+  const text = msg.text?.trim() || "";
+
+  if (text.startsWith("/mint")) {
+    const parts = text.split(/\s+/);
+    const address = parts[1];
+    const quantity = parts[2] ? parseInt(parts[2], 10) : 1;
+
+    if (!address || !ethers.isAddress(address)) {
+      await sendAlert(
+        "Usage: `/mint <contract_address> [quantity]`\n\nExample: `/mint 0xAbC...123 1`"
+      );
+      return;
+    }
+
+    await sendAlert(`⏳ Attempting to mint from \`${address}\`...`);
+    const result = await executeMint(provider, address, quantity);
+
+    if (result.success) {
+      await sendAlert(
+        `✅ *Mint successful*\n\nContract: \`${address}\`\n` +
+          `Function used: ${result.functionUsed}\n` +
+          `[View transaction](https://robinhoodchain.blockscout.com/tx/${result.txHash})`
+      );
+    } else {
+      await sendAlert(`❌ *Mint failed*\n\n${result.error || "Unknown error"}`);
+    }
+    return;
+  }
+
+  if (text.startsWith("/balance")) {
+    const info = await getMintWalletBalance(provider);
+    if (!info) {
+      await sendAlert("Mint wallet not configured — set `MINT_WALLET_PRIVATE_KEY` to enable.");
+    } else {
+      await sendAlert(`Mint wallet: \`${info.address}\`\nBalance: ${info.balance} ETH`);
+    }
+    return;
+  }
+});
 
 async function main() {
   log("Starting Robinhood Chain free mint detector...");
